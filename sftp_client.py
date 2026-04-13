@@ -261,11 +261,27 @@ class SFTPClient:
             items = os.listdir(path)
             for item in sorted(items):
                 item_path = os.path.join(path, item)
+                is_link = os.path.islink(item_path)
+                link_target = ""
+                if is_link:
+                    try:
+                        link_target = os.readlink(item_path)
+                    except:
+                        pass
                 is_dir = os.path.isdir(item_path)
-                stat_info = os.stat(item_path)
+                stat_info = os.lstat(item_path) if is_link else os.stat(item_path)
                 size = stat_info.st_size if not is_dir else ""
                 modified = datetime.fromtimestamp(stat_info.st_mtime).strftime("%Y-%m-%d %H:%M")
-                name = f"📁 {item}" if is_dir else item
+
+                if is_link:
+                    if link_target:
+                        name = f"🔗 {item} -> {link_target}"
+                    else:
+                        name = f"🔗 {item}"
+                elif is_dir:
+                    name = f"📁 {item}"
+                else:
+                    name = item
                 self.local_tree.insert("", tk.END, values=(name, size, modified))
         except Exception as e:
             messagebox.showerror("错误", str(e))
@@ -292,11 +308,29 @@ class SFTPClient:
 
         try:
             items = self.sftp.listdir_attr(path)
-            for item in sorted(items, key=lambda x: (not stat.S_ISDIR(x.st_mode), x.filename)):
+            # 排序规则：第一级是软链接或目录(0)，第二级是文件(1)，每级内按文件名排序
+            for item in sorted(items, key=lambda x: (0 if (stat.S_ISLNK(x.st_mode) or stat.S_ISDIR(x.st_mode)) else 1, x.filename)):
+                is_link = stat.S_ISLNK(item.st_mode)
                 is_dir = stat.S_ISDIR(item.st_mode)
                 size = item.st_size if not is_dir else ""
                 modified = datetime.fromtimestamp(item.st_mtime).strftime("%Y-%m-%d %H:%M")
-                name = f"📁 {item.filename}" if is_dir else item.filename
+
+                if is_link:
+                    # 尝试读取软链接目标
+                    link_target = ""
+                    try:
+                        link_path = os.path.join(path, item.filename).replace("\\", "/")
+                        link_target = self.sftp.readlink(link_path)
+                    except:
+                        pass
+                    if link_target:
+                        name = f"🔗 {item.filename} -> {link_target}"
+                    else:
+                        name = f"🔗 {item.filename}"
+                elif is_dir:
+                    name = f"📁 {item.filename}"
+                else:
+                    name = item.filename
                 self.remote_tree.insert("", tk.END, values=(name, size, modified))
         except Exception as e:
             messagebox.showerror("错误", str(e))
@@ -318,6 +352,13 @@ class SFTPClient:
             new_path = os.path.join(self.current_local_path, dir_name)
             self.local_path_var.set(new_path)
             self.refresh_local()
+        elif name.startswith("🔗 "):
+            # 提取软链接名称（去掉 🔗 和 -> 后面的内容）
+            link_name = name[2:].split(" -> ")[0]
+            link_path = os.path.join(self.current_local_path, link_name)
+            if os.path.isdir(link_path):
+                self.local_path_var.set(link_path)
+                self.refresh_local()
 
     def on_remote_double_click(self, event):
         if not self.sftp:
@@ -339,6 +380,46 @@ class SFTPClient:
             new_path = os.path.join(self.current_remote_path, dir_name).replace("\\", "/")
             self.remote_path_var.set(new_path)
             self.refresh_remote()
+        elif name.startswith("🔗 "):
+            # 提取软链接名称（去掉 🔗 和 -> 后面的内容）
+            link_name = name[2:].split(" -> ")[0]
+            link_path = os.path.join(self.current_remote_path, link_name).replace("\\", "/")
+            # 尝试判断链接指向的是否为目录
+            try:
+                # 使用 stat 判断链接目标是否为目录
+                st = self.sftp.stat(link_path)
+                if stat.S_ISDIR(st.st_mode):
+                    self.remote_path_var.set(link_path)
+                    self.refresh_remote()
+            except:
+                pass
+
+    def upload_directory(self, local_dir, remote_dir, progress_callback):
+        """递归上传目录"""
+        try:
+            self.sftp.mkdir(remote_dir)
+        except IOError:
+            pass  # 目录可能已存在
+
+        for item in os.listdir(local_dir):
+            local_path = os.path.join(local_dir, item)
+            remote_path = os.path.join(remote_dir, item).replace("\\", "/")
+
+            if os.path.islink(local_path):
+                # 处理软链接
+                link_target = os.readlink(local_path)
+                try:
+                    self.sftp.symlink(link_target, remote_path)
+                except:
+                    real_path = os.path.join(os.path.dirname(local_path), link_target)
+                    if os.path.exists(real_path) and not os.path.isdir(real_path):
+                        self.sftp.put(real_path, remote_path, callback=progress_callback)
+            elif os.path.isdir(local_path):
+                # 递归上传子目录
+                self.upload_directory(local_path, remote_path, progress_callback)
+            else:
+                # 上传文件
+                self.sftp.put(local_path, remote_path, callback=progress_callback)
 
     def upload_files(self):
         if not self.sftp:
@@ -360,14 +441,37 @@ class SFTPClient:
                 for sel in selection:
                     item = self.local_tree.item(sel)
                     name = item["values"][0]
-                    if name == ".." or name.startswith("📁 "):
+                    if name == "..":
                         continue
 
-                    filename = name
+                    # 提取真实名称
+                    if name.startswith("📁 "):
+                        filename = name[2:]
+                    elif name.startswith("🔗 "):
+                        filename = name[2:].split(" -> ")[0]
+                    else:
+                        filename = name
+
                     local_path = os.path.join(self.current_local_path, filename)
                     remote_path = os.path.join(self.current_remote_path, filename).replace("\\", "/")
 
-                    self.sftp.put(local_path, remote_path, callback=progress_callback)
+                    if os.path.isdir(local_path) and not os.path.islink(local_path):
+                        # 上传目录
+                        self.upload_directory(local_path, remote_path, progress_callback)
+                    elif os.path.islink(local_path):
+                        # 上传软链接
+                        link_target = os.readlink(local_path)
+                        try:
+                            self.sftp.symlink(link_target, remote_path)
+                        except Exception as e:
+                            real_path = os.path.join(os.path.dirname(local_path), link_target)
+                            if os.path.exists(real_path) and not os.path.isdir(real_path):
+                                self.sftp.put(real_path, remote_path, callback=progress_callback)
+                            else:
+                                raise
+                    else:
+                        # 上传文件
+                        self.sftp.put(local_path, remote_path, callback=progress_callback)
 
                 self.root.after(0, lambda: messagebox.showinfo("成功", "上传完成"))
                 self.root.after(0, self.refresh_remote)
@@ -377,6 +481,32 @@ class SFTPClient:
                 self.progress_var.set(0)
 
         threading.Thread(target=upload_thread, daemon=True).start()
+
+    def download_directory(self, remote_dir, local_dir, progress_callback):
+        """递归下载目录"""
+        if not os.path.exists(local_dir):
+            os.makedirs(local_dir)
+
+        for item in self.sftp.listdir_attr(remote_dir):
+            remote_path = os.path.join(remote_dir, item.filename).replace("\\", "/")
+            local_path = os.path.join(local_dir, item.filename)
+
+            if stat.S_ISLNK(item.st_mode):
+                # 处理软链接
+                link_target = self.sftp.readlink(remote_path)
+                try:
+                    if os.name == 'posix':
+                        os.symlink(link_target, local_path)
+                    else:
+                        self.sftp.get(remote_path, local_path, callback=progress_callback)
+                except OSError:
+                    self.sftp.get(remote_path, local_path, callback=progress_callback)
+            elif stat.S_ISDIR(item.st_mode):
+                # 递归下载子目录
+                self.download_directory(remote_path, local_path, progress_callback)
+            else:
+                # 下载文件
+                self.sftp.get(remote_path, local_path, callback=progress_callback)
 
     def download_files(self):
         if not self.sftp:
@@ -398,14 +528,38 @@ class SFTPClient:
                 for sel in selection:
                     item = self.remote_tree.item(sel)
                     name = item["values"][0]
-                    if name == ".." or name.startswith("📁 "):
+                    if name == "..":
                         continue
 
-                    filename = name
+                    # 提取真实名称
+                    if name.startswith("📁 "):
+                        filename = name[2:]
+                    elif name.startswith("🔗 "):
+                        filename = name[2:].split(" -> ")[0]
+                    else:
+                        filename = name
+
                     remote_path = os.path.join(self.current_remote_path, filename).replace("\\", "/")
                     local_path = os.path.join(self.current_local_path, filename)
 
-                    self.sftp.get(remote_path, local_path, callback=progress_callback)
+                    # 检查文件类型
+                    st = self.sftp.lstat(remote_path)
+                    if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+                        # 下载目录
+                        self.download_directory(remote_path, local_path, progress_callback)
+                    elif stat.S_ISLNK(st.st_mode):
+                        # 下载软链接
+                        link_target = self.sftp.readlink(remote_path)
+                        try:
+                            if os.name == 'posix':
+                                os.symlink(link_target, local_path)
+                            else:
+                                self.sftp.get(remote_path, local_path, callback=progress_callback)
+                        except OSError:
+                            self.sftp.get(remote_path, local_path, callback=progress_callback)
+                    else:
+                        # 下载文件
+                        self.sftp.get(remote_path, local_path, callback=progress_callback)
 
                 self.root.after(0, lambda: messagebox.showinfo("成功", "下载完成"))
                 self.root.after(0, self.refresh_local)
