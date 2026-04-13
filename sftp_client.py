@@ -259,16 +259,23 @@ class SFTPClient:
 
         try:
             items = os.listdir(path)
-            for item in sorted(items):
+            # 先收集所有文件信息
+            file_list = []
+            for item in items:
                 item_path = os.path.join(path, item)
                 is_link = os.path.islink(item_path)
+                is_dir = os.path.isdir(item_path)
+                file_list.append((item, is_link, is_dir))
+
+            # 排序规则：第一级是软链接或目录(0)，第二级是文件(1)，每级内按文件名排序
+            for item, is_link, is_dir in sorted(file_list, key=lambda x: (0 if (x[1] or x[2]) else 1, x[0])):
+                item_path = os.path.join(path, item)
                 link_target = ""
                 if is_link:
                     try:
                         link_target = os.readlink(item_path)
                     except:
                         pass
-                is_dir = os.path.isdir(item_path)
                 stat_info = os.lstat(item_path) if is_link else os.stat(item_path)
                 size = stat_info.st_size if not is_dir else ""
                 modified = datetime.fromtimestamp(stat_info.st_mtime).strftime("%Y-%m-%d %H:%M")
