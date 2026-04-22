@@ -8,6 +8,67 @@ import os
 import stat
 import paramiko
 from datetime import datetime
+import json
+
+
+def get_config_dir():
+    """获取用户配置目录"""
+    config_dir = os.path.join(os.path.expanduser("~"), ".pysftp")
+    if not os.path.exists(config_dir):
+        try:
+            os.makedirs(config_dir)
+        except Exception as e:
+            print(f"无法创建配置目录: {e}")
+            return None
+    return config_dir
+
+
+def get_favorites_file():
+    """获取收藏文件路径"""
+    config_dir = get_config_dir()
+    if config_dir:
+        return os.path.join(config_dir, "favorites.json")
+    return None
+
+
+def load_favorites():
+    """加载收藏的主机信息"""
+    favorites_file = get_favorites_file()
+    if favorites_file and os.path.exists(favorites_file):
+        try:
+            with open(favorites_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"无法加载收藏数据: {e}")
+    return []
+
+
+def save_favorites(favorites):
+    """保存收藏的主机信息"""
+    favorites_file = get_favorites_file()
+    if favorites_file:
+        try:
+            with open(favorites_file, "w", encoding="utf-8") as f:
+                json.dump(favorites, f, indent=4, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"无法保存收藏数据: {e}")
+    return False
+
+
+def format_file_size(size_bytes):
+    """格式化文件大小，添加适当的单位"""
+    if size_bytes == 0:
+        return "0 bytes"
+    units = ["bytes", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
 
 
 class SFTPClient:
@@ -31,9 +92,16 @@ class SFTPClient:
 
         # 主机
         ttk.Label(conn_frame, text="主机:").grid(row=0, column=0, padx=5, pady=5)
-        self.host_entry = ttk.Entry(conn_frame, width=20)
-        self.host_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.host_entry.insert(0, "localhost")
+        # 主机地址选择框
+        self.host_var = tk.StringVar()
+        self.host_combobox = ttk.Combobox(conn_frame, textvariable=self.host_var, width=28)
+        self.host_combobox.grid(row=0, column=1, padx=5, pady=5)
+        # 加载收藏的主机地址
+        self.load_favorites_to_combobox()
+        # 绑定选择事件
+        self.host_combobox.bind("<<ComboboxSelected>>", self.on_host_selected)
+        # 默认值
+        self.host_combobox.set("localhost")
 
         # 端口
         ttk.Label(conn_frame, text="端口:").grid(row=0, column=2, padx=5, pady=5)
@@ -48,7 +116,7 @@ class SFTPClient:
 
         # 密码
         ttk.Label(conn_frame, text="密码:").grid(row=1, column=0, padx=5, pady=5)
-        self.password_entry = ttk.Entry(conn_frame, width=20, show="*")
+        self.password_entry = ttk.Entry(conn_frame, width=30, show="*")
         self.password_entry.grid(row=1, column=1, padx=5, pady=5)
 
         # 密钥文件
@@ -59,8 +127,14 @@ class SFTPClient:
 
         # 连接按钮
         self.connect_btn = ttk.Button(conn_frame, text="连接", command=self.connect_sftp)
-        self.connect_btn.grid(row=0, column=6, rowspan=2, padx=10, pady=5)
-        ttk.Button(conn_frame, text="断开", command=self.disconnect_sftp).grid(row=0, column=7, rowspan=2, padx=5, pady=5)
+        self.connect_btn.grid(row=0, column=6, padx=10, pady=5)
+        # 收藏按钮
+        self.favorite_btn = ttk.Button(conn_frame, text="☆", style="Favorite.TButton", command=self.toggle_favorite)
+        self.favorite_btn.grid(row=1, column=8, padx=5, pady=5)
+        # 初始化按钮状态
+        self.is_favorite = False
+        self.favorite_btn.config(state=tk.DISABLED)
+        ttk.Button(conn_frame, text="断开", command=self.disconnect_sftp).grid(row=0, column=8, padx=5, pady=5)
 
         # 状态标签
         self.status_label = ttk.Label(conn_frame, text="未连接", foreground="red")
@@ -188,7 +262,7 @@ class SFTPClient:
         self.refresh_remote()
 
     def connect_sftp(self):
-        host = self.host_entry.get()
+        host = self.host_combobox.get()
         port = int(self.port_entry.get())
         username = self.username_entry.get()
         password = self.password_entry.get()
@@ -223,6 +297,9 @@ class SFTPClient:
 
                 self.root.after(0, lambda: self.status_label.config(text=f"已连接到 {host}", foreground="green"))
                 self.root.after(0, self.refresh_remote)
+                # 启用收藏按钮并检查是否已收藏
+                self.root.after(0, lambda: self.favorite_btn.config(state=tk.NORMAL))
+                self.root.after(0, self.check_if_favorite)
 
             except Exception as e:
                 self.root.after(0, lambda: self.status_label.config(text=f"连接失败: {str(e)}", foreground="red"))
@@ -242,6 +319,106 @@ class SFTPClient:
         self.status_label.config(text="未连接", foreground="red")
         for item in self.remote_tree.get_children():
             self.remote_tree.delete(item)
+        # 禁用收藏按钮
+        self.favorite_btn.config(state=tk.DISABLED, text="☆")
+        self.is_favorite = False
+
+    def load_favorites_to_combobox(self):
+        """加载收藏的主机地址到下拉菜单"""
+        favorites = load_favorites()
+        if favorites:
+            # 格式化显示为 "{username}@{ip}:{port}"
+            host_list = [f"{fav['username']}@{fav['ip']}:{fav.get('port', 22)}" for fav in favorites]
+            self.host_combobox["values"] = host_list
+        else:
+            # 收藏列表为空时，清空下拉菜单内容
+            self.host_combobox["values"] = []
+        # 强制刷新 Combobox 显示
+        self.host_combobox.update()
+
+    def on_host_selected(self, event):
+        """当选择主机地址时自动填充用户名和端口"""
+        selected_text = self.host_combobox.get()
+        # 从格式化为 "username@ip:port" 的字符串中提取信息
+        if "@" in selected_text and ":" in selected_text:
+            username, rest = selected_text.split("@", 1)
+            ip, port = rest.split(":", 1)
+
+            # 更新各个输入字段
+            self.host_combobox.set(ip)
+            self.username_entry.delete(0, tk.END)
+            self.username_entry.insert(0, username)
+            self.port_entry.delete(0, tk.END)
+            self.port_entry.insert(0, port)
+        elif "@" in selected_text:
+            # 如果只有 username@ip 格式
+            username, ip = selected_text.split("@", 1)
+            self.host_combobox.set(ip)
+            self.username_entry.delete(0, tk.END)
+            self.username_entry.insert(0, username)
+        elif ":" in selected_text:
+            # 如果只有 ip:port 格式
+            ip, port = selected_text.split(":", 1)
+            self.host_combobox.set(ip)
+            self.port_entry.delete(0, tk.END)
+            self.port_entry.insert(0, port)
+
+    def toggle_favorite(self):
+        """切换收藏状态"""
+        if not self.sftp:
+            return
+
+        current_ip = self.host_combobox.get()
+        current_username = self.username_entry.get()
+
+        favorites = load_favorites()
+
+        if self.is_favorite:
+            # 取消收藏
+            current_port = int(self.port_entry.get())
+            favorites = [fav for fav in favorites if not (fav["ip"] == current_ip and fav["username"] == current_username and fav.get("port", 22) == current_port)]
+            self.favorite_btn.config(text="☆")
+            self.is_favorite = False
+        else:
+            # 添加收藏
+            favorite = {"ip": current_ip, "username": current_username, "port": int(self.port_entry.get())}
+            # 检查是否已存在相同的收藏项（包含 IP、用户名和端口）
+            exists = False
+            for fav in favorites:
+                if fav["ip"] == current_ip and fav["username"] == current_username and fav["port"] == int(self.port_entry.get()):
+                    exists = True
+                    break
+            if not exists:
+                favorites.append(favorite)
+                self.favorite_btn.config(text="★")
+                self.is_favorite = True
+
+        save_favorites(favorites)
+        # 更新下拉菜单
+        self.load_favorites_to_combobox()
+
+    def check_if_favorite(self):
+        """检查当前连接的主机是否已收藏"""
+        if not self.sftp:
+            return False
+
+        current_ip = self.host_combobox.get()
+        current_username = self.username_entry.get()
+        current_port = int(self.port_entry.get())
+
+        favorites = load_favorites()
+
+        # 初始状态设置为未收藏
+        self.favorite_btn.config(text="☆")
+        self.is_favorite = False
+
+        for fav in favorites:
+            if fav["ip"] == current_ip and fav["username"] == current_username and fav.get("port", 22) == current_port:
+                self.favorite_btn.config(text="★")
+                self.is_favorite = True
+                break
+
+        return self.is_favorite
 
     def refresh_local(self):
         path = self.local_path_var.get() or self.current_local_path
@@ -285,11 +462,14 @@ class SFTPClient:
                         name = f"🔗 {item} -> {link_target}"
                     else:
                         name = f"🔗 {item}"
+                    formatted_size = "<link>"
                 elif is_dir:
                     name = f"📁 {item}"
+                    formatted_size = "<dir>"
                 else:
                     name = item
-                self.local_tree.insert("", tk.END, values=(name, size, modified))
+                    formatted_size = format_file_size(size)
+                self.local_tree.insert("", tk.END, values=(name, formatted_size, modified))
         except Exception as e:
             messagebox.showerror("错误", str(e))
 
@@ -334,11 +514,14 @@ class SFTPClient:
                         name = f"🔗 {item.filename} -> {link_target}"
                     else:
                         name = f"🔗 {item.filename}"
+                    formatted_size = "<link>"
                 elif is_dir:
                     name = f"📁 {item.filename}"
+                    formatted_size = "<dir>"
                 else:
                     name = item.filename
-                self.remote_tree.insert("", tk.END, values=(name, size, modified))
+                    formatted_size = format_file_size(size)
+                self.remote_tree.insert("", tk.END, values=(name, formatted_size, modified))
         except Exception as e:
             messagebox.showerror("错误", str(e))
 
