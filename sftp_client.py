@@ -12,15 +12,23 @@ import json
 
 
 def get_config_dir():
-    """获取用户配置目录"""
-    config_dir = os.path.join(os.path.expanduser("~"), ".pysftp")
-    if not os.path.exists(config_dir):
-        try:
+    """获取用户配置目录，适配 Linux 和 Windows 系统"""
+    try:
+        if os.name == "nt":  # Windows 系统
+            # 在 Windows 系统上，通常使用 C:\Users\%username%\.pysftp
+            home_dir = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+            config_dir = os.path.join(home_dir, ".pysftp")
+        else:  # Linux 和其他系统
+            # 在 Linux 系统上，使用 ~/.pysftp
+            home_dir = os.path.expanduser("~")
+            config_dir = os.path.join(home_dir, ".pysftp")
+
+        if not os.path.exists(config_dir):
             os.makedirs(config_dir)
-        except Exception as e:
-            print(f"无法创建配置目录: {e}")
-            return None
-    return config_dir
+        return config_dir
+    except Exception as e:
+        print(f"无法创建或访问配置目录: {e}")
+        return None
 
 
 def get_favorites_file():
